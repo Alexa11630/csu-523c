@@ -1,0 +1,553 @@
+---
+title: "lab-05"
+format: html
+editor: visual
+---
+
+## Set Up
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(powerjoin)
+library(glue)
+library(vip)
+library(baguette)
+```
+
+```{r}
+root <- 'https://zenodo.org/records/15529996/files'
+
+download.file('https://zenodo.org/records/15529996/files/camels_attributes_v2.0.pdf?download=1',
+              'data/camels_attributes_v2.0.pdf',
+              mode = 'wb')
+```
+
+```{r}
+types <- c("clim", "geol", "soil", "topo", "vege", "hydro")
+
+# Where the files live online ...
+remote_files  <- glue('{root}/camels_{types}.txt?download=1')
+
+# where we want to download the data ...
+local_files   <- glue('data/camels_{types}.txt')
+
+walk2(remote_files, local_files, download.file, quiet = TRUE)
+
+# Read and merge data
+camels <- map(local_files, read_delim, show_col_types = FALSE) 
+
+camels <- power_full_join(camels ,by = 'gauge_id')
+```
+
+## Question 1
+
+`zero_q_freq` is a hydrological signature that represents the frequency of days with Q=0 mm/day shown as a percentage.
+
+```{r}
+#Exploratory Data Analysis
+ggplot(data = camels, aes(x = gauge_lon, y = gauge_lat)) +
+  borders("state", colour = "gray50") +
+  geom_point(aes(color = q_mean)) +
+  scale_color_gradient(low = "pink", high = "dodgerblue") +
+  ggthemes::theme_map()
+```
+
+## Question 2
+
+```{r}
+#Mean Daily Precip Map
+p_mean_map <- ggplot(data = camels, aes(x = gauge_lon, y = gauge_lat)) +
+  borders("state", colour = "gray50") +
+  geom_point(aes(color = p_mean)) +
+  scale_color_gradient(low = "pink", high = "dodgerblue") +
+  ggthemes::theme_map() +
+labs(
+    title = "Mean Daily Precipitation Across Gauges",
+    x = "Longitude",
+    y = "Latitude",
+    color = "Mean Precip (p_mean)")
+
+#Aridity Map
+aridity_map <- ggplot(data = camels, aes(x = gauge_lon, y = gauge_lat)) +
+  borders("state", colour = "gray50") +
+  geom_point(aes(color = aridity)) +
+  scale_color_gradient(low = "pink", high = "dodgerblue") +
+  ggthemes::theme_map() +
+labs(
+    title = "Aridity Across Gauges",
+    x = "Longitude",
+    y = "Latitude",
+    color = "Aridity")
+
+library(ggpubr)
+ggarrange(
+  aridity_map + coord_fixed() + theme(legend.position = "bottom"),
+  p_mean_map  + coord_fixed() + theme(legend.position = "bottom"),
+  ncol = 1, nrow = 2)
+```
+
+## Preparation and Examples
+
+```{r}
+#Set up data
+set.seed(184)
+# Bad form to perform simple transformations on the outcome variable within a 
+# recipe. So, we'll do it here.
+camels <- camels |> 
+  mutate(logQmean = log(q_mean))
+
+# Generate the split
+camels_split <- initial_split(camels, prop = 0.8)
+camels_train <- training(camels_split)
+camels_test  <- testing(camels_split)
+
+camels_cv <- vfold_cv(camels_train, v = 10)
+
+# Create a recipe to preprocess the data
+rec <-  recipe(logQmean ~ aridity + p_mean, data = camels_train) %>%
+  # Log transform the predictor variables (aridity and p_mean)
+  step_log(all_predictors()) %>%
+  # Add an interaction term between aridity and p_mean
+  step_interact(terms = ~ aridity:p_mean) |> 
+  # Drop any rows with missing values in the pred
+  step_naomit(all_predictors(), all_outcomes())
+```
+
+```{r}
+#Linear Model
+# Prepare the data
+baked_data <- prep(rec, camels_train) |> 
+  bake(new_data = NULL)
+
+# Interaction with lm
+#  Base lm sets interaction terms with the * symbol
+lm_base <- lm(logQmean ~ aridity * p_mean, data = baked_data)
+summary(lm_base)
+
+# Sanity Interaction term from recipe ... these should be equal!!
+summary(lm(logQmean ~ aridity + p_mean + aridity_x_p_mean, data = baked_data))
+```
+
+```{r}
+#Validate and Evaluate
+test_data <-  bake(prep(rec), new_data = camels_test)
+test_data$lm_pred <- predict(lm_base, newdata = test_data)
+
+#Common regression metrics such as RMSE, R-squared, and MAE between the observed and predicted values
+metrics(test_data, truth = logQmean, estimate = lm_pred)
+
+ggplot(test_data, aes(x = logQmean, y = lm_pred, colour = aridity)) +
+  # Apply a gradient color scale
+  scale_color_gradient2(low = "brown", mid = "orange", high = "darkgreen") +
+  geom_point() +
+  geom_abline(linetype = 2) +
+  theme_linedraw() + 
+  labs(title = "Linear Model: Observed vs Predicted",
+       x = "Observed Log Mean Flow",
+       y = "Predicted Log Mean Flow",
+       color = "Aridity")
+```
+
+```{r}
+#Using Workflow
+# Define model
+lm_model <- linear_reg() %>%
+  # define the engine
+  set_engine("lm") %>%
+  # define the mode
+  set_mode("regression")
+
+# Instantiate a workflow ...
+lm_wf <- workflow() %>%
+  # Add the recipe
+  add_recipe(rec) %>%
+  # Add the model
+  add_model(lm_model) %>%
+  # Fit the model to the training data
+  fit(data = camels_train) 
+
+# Extract the model coefficients from the workflow
+summary(extract_fit_engine(lm_wf))$coefficients
+
+# From the base implementation
+summary(lm_base)$coefficients
+```
+
+```{r}
+#Predictions and Eval
+lm_data <- augment(lm_wf, new_data = camels_test)
+dim(lm_data)
+
+metrics(lm_data, truth = logQmean, estimate = .pred)
+
+#scatter plot of the observed vs predicted values, colored by aridity, to visualize the model performance
+ggplot(lm_data, aes(x = logQmean, y = .pred, colour = aridity)) +
+  scale_color_viridis_c() +
+  geom_point() +
+  geom_abline() +
+  theme_linedraw()
+```
+
+```{r}
+library(baguette)
+rf_model <- rand_forest() %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("regression")
+
+rf_wf <- workflow() %>%
+  # Add the recipe
+  add_recipe(rec) %>%
+  # Add the model
+  add_model(rf_model) %>%
+  # Fit the model
+  fit(data = camels_train) 
+
+rf_data <- augment(rf_wf, new_data = camels_test)
+dim(rf_data)
+
+#Workflow set w/ 2 models and comparison
+wf <- workflow_set(list(rec), list(lm_model, rf_model)) %>%
+  workflow_map('fit_resamples', resamples = camels_cv) 
+
+autoplot(wf)
+
+rank_results(wf, rank_metric = "rsq", select_best = TRUE)
+```
+
+```{r}
+#rf wins -> final model
+final <- workflow() |>
+  add_recipe(rec) |>
+  add_model(rf_model) |>
+  fit(data = camels_train)
+
+#Eval
+# Variable importance (which predictors is the model actually using)
+final |>
+  extract_fit_parsnip() |>
+  vip::vip()
+
+# Predictions on the test set (Test-set metrics — apply the trained model to data it has never seen)
+rf_data <- augment(final, new_data = camels_test)
+
+# Regression metrics (rmse, rsq, mae by default)
+metrics(rf_data, truth = logQmean, estimate = .pred)
+
+#Visual check (the 1:1 line should run through the cloud)
+ggplot(rf_data, aes(x = logQmean, y = .pred, colour = aridity)) +
+  scale_color_viridis_c() +
+  geom_point() +
+  # 1:1 line — perfect prediction
+  geom_abline(linetype = 2) +
+  # Actual regression line for contrast
+  geom_smooth(method = "lm", col = 'red', linetype = 2, se = FALSE) +
+  theme_linedraw() +
+  labs(title = "Random Forest Model: Observed vs Predicted",
+       x = "Observed Log Mean Flow",
+       y = "Predicted Log Mean Flow",
+       color = "Aridity")
+```
+
+## Question 3
+
+```{r}
+#XGBoost
+xgb_model <- boost_tree() %>%
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+
+xgb_wf <- workflow() %>%
+  add_recipe(rec) %>% 
+  add_model(xgb_model) %>%
+  fit(data = camels_train)
+
+
+
+#Neural Network
+nn_model <- bag_mlp() %>%
+  set_engine("nnet") %>%
+  set_mode("regression")
+
+nn_wf <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(nn_model) %>%
+  fit(data = camels_train)
+
+
+wf2 <- workflow_set(
+  list(rec), 
+  list(lm_model, rf_model, xgb_model, nn_model)) %>%
+  workflow_map('fit_resamples', resamples = camels_cv)
+
+autoplot(wf2)
+
+rank_results(wf2, rank_metric = "rsq", select_best = TRUE)
+```
+
+Which of the four would you move forward with?
+
+Answer: I would use the random forest model. This has the lowest RMSE (which measures how far off your predictions are from the true values) indicating the predicted value are closer to that actual values compared to the other models. It also has the highest RSQ (which is how much of the variation in the data your model explains) meaning this model does the best at explaining the variations compared to the other models.
+
+## Question 4- Data Prep and EDA
+
+```{r}
+#Set up and skim
+set.seed(198)
+
+library(skimr)
+skimr::skim(camels, q_mean)
+```
+
+This tells me that q_mean has one missing value and is essentially 99% complete. Additionally, I know this variable is mean discharge which continuous. Finally, the sd and histogram show a heavily right skewed distribution.
+
+Chosen Variables:
+
+- **p_mean:** because it represents the primary water input to a catchment, directly controlling how much water is available to become streamflow.
+- **soil_porosity:** because it determines how much precipitation the soil can store versus route to runoff, strongly influencing how rainfall is converted into streamflow.
+
+```{r}
+skimr::skim(camels, soil_porosity) #low sd, heavily right skewed
+skimr::skim(camels, p_mean) #high sd, heavily right skewed
+```
+
+```{r}
+#Visualize distribution
+ggplot(camels, aes(x = soil_porosity, y = p_mean)) +
+  geom_point(aes(color = q_mean)) +
+  geom_smooth(method = "lm", color = "red", linetype = 2) +
+  scale_color_viridis_c() +
+  theme_linedraw() + 
+  theme(legend.position = "bottom") + 
+  labs(title = "Soil Porosity vs Rainfall vs Runoff",
+       x = "Soil Porosity",
+       y = "Rainfall",
+       color = "Mean Flow")
+```
+
+- Soil porosity: bounded (roughly 0.38–0.67) and heavily concentrated in a narrow band (\~0.40–0.46). Likely low variance and right skew based on skim results. Use `step_normalize(all_predictors())` since porosity is bounded and on a different scale
+- p_mean (rainfall): right-skewed (long tail) and possibly weakly bimodal (dense low cluster \~2–4 with less in a higher cluster \~5–8). Use `step_log(p_mean)`
+- q_mean (color): right-skewed (more low-flow points, fewer high-flow extremes). Use `step_log(q_mean)`
+- Relationship: porosity vs rainfall shows very weak (slightly negative) linear trend
+
+```{r}
+#Morans I
+library(ape)
+
+set.seed(10)
+samp <- slice_sample(camels, n = 400)
+dmat <- as.matrix(dist(cbind(samp$gauge_lon, samp$gauge_lat)))
+W <- 1 / dmat; diag(W) <- 0
+W <- W / rowSums(W)
+
+preds_I <- samp |>
+  select(where(is.numeric), -gauge_id) |>
+  map_dfr(
+    ~ tibble(I = Moran.I(.x, W, na.rm = TRUE)$observed),
+    .id = "variable"
+  ) |>
+  arrange(desc(I))
+
+#Show top 10 predictors and soil porosity at the bottom
+preds_I |>
+  slice_max(I, n = 10) |>
+  bind_rows(
+    preds_I |> filter(variable == "soil_porosity")
+  ) |>
+  distinct(variable, .keep_all = TRUE) |>
+  ggplot(aes(x = reorder(variable, I), y = I)) +
+  geom_col() +
+  coord_flip() +
+  theme_minimal()
+```
+
+```{r}
+#Split and stratification
+camels_split2 <- initial_split(camels, prop = 0.75)
+camels_train2 <- training(camels_split2)
+camels_test2  <- testing(camels_split2)
+
+camels_cv2 <- vfold_cv(camels_train2, v = 10)
+```
+
+**Why not to stratify:** This lab plans to use multiple flexible models that may be able to learn nonlinear or interaction effects across all oof the basins without splitting the data. So, stratification is unnecessary and can potentially reduce sample size too much.
+
+## Question 4- Recipe
+
+```{r}
+rec2 <- recipe(q_mean ~ p_mean + soil_porosity, data = camels_train2) %>%
+  # Log-transform precip b/c right skew and stabilize variance
+  step_log(p_mean) %>%
+  
+  # Normalize all predictors because soil porosity is bounded and on a different scale than rainfall
+  step_normalize(all_predictors()) %>%
+  
+  # Add interaction between rainfall and soil structure to capture differing runoff efficiency
+  step_interact(terms = ~ p_mean:soil_porosity) %>%
+  
+  # Remove any rows with missing values to ensure model compatibility
+  step_naomit(all_predictors(), all_outcomes())
+```
+
+This recipe uses **p_mean and soil porosity as predictors** because precipitation controls water input to the system while soil porosity influences how much of that water is stored instead of converted to runoff, making them possibly physically meaningful drivers of q_mean. The response variable is log-transformed (log(q_mean)) because q_mean is right-skewed with many low flows and a few high extremes (see graph above). p_mean is log-transformed as well because it is also right-skewed with a long tail and a weak bimodal structure (see graph). All predictors are normalized because soil porosity is bounded and concentrated in a narrow range, while rainfall varies more widely, so scaling prevents rainfall from overwhelming the model. An interaction between p_mean and soil porosity is included because the effect of rainfall on streamflow likely connects to soil structure, meaning that runoff efficiency changes across different infiltration capacities.
+
+## Question 4- Define 3 Models
+
+```{r}
+rf_model2 <- rand_forest() %>%
+  set_engine("ranger") %>%
+  set_mode("regression")
+
+mlp_model <- mlp() %>%
+  set_engine("nnet") %>%
+  set_mode("regression")
+
+tree_model <- decision_tree() %>%
+  set_engine("rpart") %>%
+  set_mode("regression")
+```
+
+Model Decisions:
+
+- Decision tree- This can be used as a good baseline as it is good at modeling non linear relationships, although it may overfit.
+- MLP (neural network)- This model can learn about the highly non-linear interactions between rainfall and soil porosity that may not be well captured by simpler tree splits.
+
+## Question 4- Workflow Set
+
+```{r}
+library(spatialsample)
+
+wf_set <- workflow_set(
+  preproc = list(camels_recipe = rec2),
+  models = list(
+    rf_model2,
+    mlp_model,
+    tree_model))
+
+set.seed(1222)
+
+# 10-fold random CV
+cv_random <- vfold_cv(camels_train2, v = 10)
+
+wf_results_random <- wf_set %>%
+  workflow_map(
+    "fit_resamples",
+    resamples = cv_random)
+
+
+library(sf)
+camels_sf <- camels_train2 |>
+  st_as_sf(coords = c("gauge_lon", "gauge_lat"),
+           crs = 4326, remove = FALSE)
+#clusters basins first, then uses clusters as folds
+cv_spatial <- spatial_clustering_cv(camels_sf, v = 10)
+
+wf_results_spatial <- wf_set %>%
+  workflow_map(
+    "fit_resamples",
+    resamples = cv_spatial)
+```
+
+```{r}
+#Visual comparison
+autoplot(wf_results_random)
+autoplot(wf_results_spatial)
+
+#Rank models
+rank_results(wf_results_random)
+rank_results(wf_results_spatial)
+```
+
+Describe the gap (5–7 sentences): which model wins, how much does performance drop when you move from random to spatial CV, and which number do you trust as your generalization estimate? What does the spread of per-fold metrics tell you about *where* your model struggles? Recall from lecture that a **small** gap is a signal that your predictors carry real transferable signal — not a failed diagnostic.
+
+Answer: MLP (neural network) is the best model in both cases. There is a large drop in both varibales from random to spatial, especially in MLP RMSE. This happens because random CV lets the model “see” nearby or similar basins which can lead to spatial autocorrelation. In contrast, spatial CV removes this by testing on entirely new regions, making prediction harder but more realistic. For this reason, I would trust the spatial CV results more. The std_err measures how much performance changes across folds showing the stability of the model under different splits. In this case, random CV has low sdr while spatial CV shows much higher variability across folds, meaning the model struggles with geographic distributions.
+
+## Question 4- Tune Best Model
+
+```{r}
+mlp_model <- mlp(
+  hidden_units = tune(),
+  penalty      = tune(),
+  epochs       = tune()) |>
+  set_engine("nnet") |>
+  set_mode("regression")
+
+mlp_params <- workflow() %>%
+  add_model(mlp_model) %>%
+  extract_parameter_set_dials()
+
+mlp_grid <- mlp_params %>%
+  grid_latin_hypercube(
+    size = 20)#number of combinations to try
+
+#Why latin hypercube- This looks a whole range of possiblities and best captures the maximum varibaility with minimum locations.
+
+mlp_tuned_spatial <- workflow() %>%
+  add_recipe(rec2) %>%
+  add_model(mlp_model) %>% 
+  tune_grid(
+    resamples = camels_cv2, #spatial folds
+    grid = mlp_grid, #latin hypercube
+    control = control_grid(
+      save_pred = TRUE))#keep predictions for analysis
+
+autoplot(mlp_tuned_spatial)
+show_best(mlp_tuned_spatial, metric = "rmse")
+```
+
+Analysis- Hidden units is the parameter that matters the most with some structure (curve) in the rmse graph and a tight range in the table, followed by penalty (regularization), then epochs. This means the model is most sensitive to the hidden units (number of neurons), meaning it may underfit or overfit depending on the number.
+
+## Question 4- Variable Importance
+
+```{r}
+b_wflow <- workflow() %>%
+  add_recipe(rec2) %>%
+  add_model(mlp_model)
+
+best_params <- select_best(mlp_tuned_spatial, metric = "rmse")
+
+#Finalize model with best parameters
+final_mlp_model <- finalize_model(mlp_model, best_params)
+
+final_wf <- finalize_workflow(b_wflow, best_params)
+
+fitted_wf <- final_wf %>%
+  fit(data = camels_train2)
+
+fitted_wf %>%
+  extract_fit_parsnip() %>%
+  vip()
+```
+
+Interpret the top predictors (4–6 sentences). Cross-reference against the predictor Moran’s I you computed in EDA — are any of the top VIP features *also* highly spatially autocorrelated? If so, they could be acting as **geographic proxies** — discuss whether the importance reflects *mechanism* or *location*.
+
+Answer- The VIP results show that p_mean has the largest **magnitude** of influence, meaning the model relies more heavily on rainfall to make predictions than on soil porosity or their interaction. Compared to the Moran’s I results, p_mean is in the top 5 spatially autocorrelated predictors, meaning it has a stronger geographic structure across basins which makes sense as it is rainfall. In contrast, soil_porosity shows low spatial autocorrelation, suggesting it varies more locally and is less tied to broad spatial patterns. This implies that the importance of p_mean may partly reflect location-based structure rather than purely local hydrologic mechanisms.
+
+## Question 4- Final Fit and Evaluation
+
+```{r}
+final_workflow <- finalize_workflow(b_wflow, best_params)
+
+(final_fit <- last_fit(final_workflow, camels_split2))
+
+collect_metrics(final_fit)
+
+collect_predictions(final_fit)
+```
+
+```{r}
+pred_df <- collect_predictions(final_fit)
+
+ggplot(pred_df, aes(x = .pred, y = q_mean)) +
+  geom_point(alpha = 0.7) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  theme_linedraw() +
+  labs(
+    title = "Observed vs Predicted Qmean on Test Set (MLP Model)",
+    x = "Predicted Qmean",
+    y = "Observed Qmean")
+```
+
+Describe what you think of the results — including how the test-set metrics compare to your spatial-CV estimate, where the model under- or over-predicts, and what you’d investigate next.
+
+Answer: The test-set predictions show a strong overall relationship with observations, indicating the model captures the general hydrologic pattern. Compared to spatial CV, the test-set performance is expected to look slightly better, but the spatial CV is more trustworthy because it prevents geographic errors. The model performed best in the low-to-mid discharge range, where points cluster around the 1:1 line but the model shows larger errors at high observed Qmean values. This may mean the model is underpredicting at high flows and/or slightly overpredicting in some low-flow cases. For next steps, I would experiment with other probable hydrologic drivers such as temperature, PET, or snow.
